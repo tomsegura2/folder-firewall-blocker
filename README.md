@@ -1,4 +1,15 @@
+PyFolderFirewallBlocker
+Copyright (c) 2025
 
+Licensed under the PolyForm Noncommercial License 1.0.0
+
+You may not use this software for commercial purposes including but not limited to:
+- Selling this software or derivatives
+- Bundling in paid products
+- Offering as part of a commercial service
+
+See full license:
+https://polyformproject.org/licenses/noncommercial/1.0.0/
 
 # Folder Firewall Blocker 2.0
 
