@@ -6,21 +6,8 @@ import sys
 def is_admin():
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
+    except Exception:
         return False
-
-if not is_admin():
-    # Relaunch the script with admin privileges
-    params = " ".join([f'"{arg}"' for arg in sys.argv])
-    ctypes.windll.shell32.ShellExecuteW(
-        None,
-        "runas",
-        sys.executable,
-        params,
-        None,
-        1
-    )
-    sys.exit(0)
 
 # ------------------------ Imports ------------------------ #
 
@@ -103,6 +90,10 @@ class RuleRegistry:
         self.rules = {}  # path -> {"rule_out": ..., "rule_in": ...}
         self._load()
 
+    @staticmethod
+    def _normalize(path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
     def _load(self):
         if self.json_path.exists():
             try:
@@ -111,7 +102,7 @@ class RuleRegistry:
                 for entry in data.get("rules", []):
                     path = entry.get("path")
                     if path:
-                        self.rules[path] = {
+                        self.rules[self._normalize(path)] = {
                             "rule_out": entry.get("rule_out"),
                             "rule_in": entry.get("rule_in"),
                         }
@@ -133,15 +124,16 @@ class RuleRegistry:
             print(f"Failed to save rules JSON: {e}", file=sys.stderr)
 
     def has_rules_for(self, path: str) -> bool:
-        return path in self.rules
+        return self._normalize(path) in self.rules
 
     def get_rules_for(self, path: str):
-        return self.rules.get(path)
+        return self.rules.get(self._normalize(path))
 
     def set_rules_for(self, path: str, rule_out: str, rule_in: str):
-        self.rules[path] = {"rule_out": rule_out, "rule_in": rule_in}
+        self.rules[self._normalize(path)] = {"rule_out": rule_out, "rule_in": rule_in}
 
     def remove_path(self, path: str):
+        path = self._normalize(path)
         if path in self.rules:
             del self.rules[path]
 
@@ -160,8 +152,9 @@ class FirewallManager:
     No external libs, just subprocess.
     """
 
-    def __init__(self, parent_widget=None):
+    def __init__(self, parent_widget=None, error_signal=None):
         self.parent_widget = parent_widget
+        self.error_signal = error_signal
 
     def _run_netsh(self, args):
         cmd = ["netsh"] + args
@@ -178,7 +171,9 @@ class FirewallManager:
             return None
 
     def _show_error(self, message: str):
-        if self.parent_widget is not None:
+        if self.error_signal is not None:
+            self.error_signal.emit(message)
+        elif self.parent_widget is not None:
             QMessageBox.critical(self.parent_widget, "Error", message)
         else:
             print("ERROR:", message, file=sys.stderr)
@@ -207,7 +202,7 @@ class FirewallManager:
             f"name={rule_out}",
             "dir=out",
             "action=block",
-            f"program={safe_path}",
+            f'program="{safe_path}"',
             "enable=yes",
             "profile=any"
         ]
@@ -217,7 +212,7 @@ class FirewallManager:
             f"name={rule_in}",
             "dir=in",
             "action=block",
-            f"program={safe_path}",
+            f'program="{safe_path}"',
             "enable=yes",
             "profile=any"
         ]
@@ -255,7 +250,9 @@ class FirewallManager:
             "advfirewall", "firewall", "delete", "rule",
             f"name={rule_name}"
         ]
-        self._run_netsh(args)
+        proc = self._run_netsh(args)
+        if proc and proc.returncode != 0:
+            print(f"Warning: failed to delete rule '{rule_name}': {proc.stdout.strip()}", file=sys.stderr)
         # No hard error if it fails (rule might not exist).
 
     def export_snapshot(self, snapshot_path: Path):
@@ -312,6 +309,7 @@ class BlockWorker(QObject):
     progress = pyqtSignal(int, str)       # (index, file_path)
     finished = pyqtSignal(int, int)       # (blocked_count, skipped_count)
     cancelled = pyqtSignal()
+    error = pyqtSignal(str)
 
     def __init__(self, files, registry: RuleRegistry, firewall: FirewallManager):
         super().__init__()
@@ -326,7 +324,6 @@ class BlockWorker(QObject):
     def run(self):
         blocked_count = 0
         skipped_count = 0
-        total = len(self.files)
 
         for index, path in enumerate(self.files, start=1):
             if self._cancel:
@@ -532,6 +529,7 @@ class MainWindow(QWidget):
         # Create worker + thread
         self.thread = QThread()
         self.worker = BlockWorker(self.file_list, self.registry, self.firewall)
+        self.firewall.error_signal = self.worker.error
         self.worker.moveToThread(self.thread)
 
         # Connect signals
@@ -539,15 +537,17 @@ class MainWindow(QWidget):
         self.worker.progress.connect(self.update_block_progress)
         self.worker.finished.connect(self.blocking_complete)
         self.worker.cancelled.connect(self.blocking_cancelled)
+        self.worker.error.connect(self.on_worker_error)
 
         # Cleanup thread after done
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
-
         self.worker.cancelled.connect(self.thread.quit)
         self.worker.cancelled.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self.on_thread_finished)
 
+        self._set_buttons_enabled(False)
         self.thread.start()
 
     def on_unblock_selected(self):
@@ -683,7 +683,7 @@ class MainWindow(QWidget):
         Combines DEFAULT_EXTENSIONS with user-specified extra types.
         Normalizes to lowercase, leading dot.
         """
-        exts = set([e.lower() for e in DEFAULT_EXTENSIONS])
+        exts = {e.lower() for e in DEFAULT_EXTENSIONS}
 
         extra = self.extra_types_edit.text().strip()
         if extra:
@@ -703,7 +703,6 @@ class MainWindow(QWidget):
         Return list of file paths in folder matching given extensions.
         """
         matches = []
-        # Realpath + abspath to handle junctions/symlinks nicely
         folder = os.path.realpath(os.path.abspath(folder))
 
         if recursive:
@@ -721,17 +720,16 @@ class MainWindow(QWidget):
                         if ext in extensions:
                             matches.append(full)
             except PermissionError:
-                # Just skip folders we can't read
                 pass
 
         return matches
 
     def _populate_list_widget(self):
         self.list_widget.clear()
-        blocked_paths = set(self.registry.rules.keys())
+        blocked_paths = {self.registry._normalize(p) for p in self.registry.rules.keys()}
 
         for path in self.file_list:
-            is_blocked = path in blocked_paths
+            is_blocked = self.registry._normalize(path) in blocked_paths
             display_text = f"[BLOCKED] {path}" if is_blocked else path
             item = QListWidgetItem(display_text)
             if is_blocked:
@@ -740,6 +738,14 @@ class MainWindow(QWidget):
                 item.setForeground(Qt.black)
             item.setData(Qt.UserRole, path)
             self.list_widget.addItem(item)
+
+    def _set_buttons_enabled(self, enabled: bool):
+        self.scan_btn.setEnabled(enabled)
+        self.block_all_btn.setEnabled(enabled)
+        self.unblock_selected_btn.setEnabled(enabled)
+        self.unblock_all_btn.setEnabled(enabled)
+        self.snapshot_export_btn.setEnabled(enabled)
+        self.snapshot_import_btn.setEnabled(enabled)
 
     # ---------- Blocking progress handlers ---------- #
 
@@ -753,27 +759,33 @@ class MainWindow(QWidget):
         self._populate_list_widget()
 
         self.append_log(
-        f"Blocking complete. New blocked: {blocked_count}, already blocked: {skipped_count}"
-            )
+            f"Blocking complete. New blocked: {blocked_count}, already blocked: {skipped_count}"
+        )
 
         self.progress.setVisible(False)
         self.progress_label.setVisible(False)
         self.cancel_button.setVisible(False)
-
-    # DO NOT clear worker/thread here!
-    # They will be cleaned up safely via deleteLater() after the thread fully stops.
+        self._set_buttons_enabled(True)
 
     def blocking_cancelled(self):
         self.append_log("Blocking cancelled by user.")
         self.progress.setVisible(False)
         self.progress_label.setVisible(False)
         self.cancel_button.setVisible(False)
-
-        # Again: DO NOT clear worker/thread here
+        self._set_buttons_enabled(True)
 
     def cancel_blocking(self):
         if self.worker is not None:
             self.worker.cancel()
+
+    def on_worker_error(self, message):
+        QMessageBox.critical(self, "Error", message)
+
+    def on_thread_finished(self):
+        # Safe place to clear references after thread fully stops
+        self.firewall.error_signal = None
+        self.worker = None
+        self.thread = None
 
 
 # ------------------------ Main entry ------------------------ #
@@ -782,6 +794,19 @@ def main():
     if not is_windows():
         print("This tool only works on Windows.", file=sys.stderr)
         return
+
+    if not is_admin():
+        # Relaunch the script with admin privileges
+        params = " ".join([f'"{arg}"' for arg in sys.argv])
+        ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            sys.executable,
+            params,
+            None,
+            1
+        )
+        sys.exit(0)
 
     app = QApplication(sys.argv)
     win = MainWindow()
