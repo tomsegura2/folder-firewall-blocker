@@ -90,7 +90,7 @@ PyQt5
 
 To create a portable EXE:
 
-_pyinstaller --onefile --noconsole py_folder_firewall_blocker.py_
+_pyinstaller --onefile --noconsole ffb.py
 
 **🚧 Disclaimer**
 
