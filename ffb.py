@@ -31,11 +31,10 @@ APP_NAME = "PyFolderFirewallBlocker"
 RULES_FILE_NAME = "pyffb_rules.json"
 SNAPSHOT_FILE_NAME = "pyffb_firewall_snapshot.wfw"
 
-# Default "executable" extensions (like classic FFB)
+# Default scan target: .exe only. Users can still add any other extensions
+# through the "Extra file types" field.
 DEFAULT_EXTENSIONS = [
-    ".exe", ".com", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse",
-    ".wsf", ".wsh", ".msc", ".scr", ".msi", ".cpl", ".ocx", ".dll",
-    ".drv", ".sys"
+    ".exe"
 ]
 
 
@@ -65,6 +64,13 @@ def hash_path(path: str) -> str:
     """
     norm = os.path.normcase(os.path.abspath(path))
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:8]
+
+
+def normalize_path(path: str) -> str:
+    """
+    Normalize a filesystem path for stable comparisons.
+    """
+    return os.path.normcase(os.path.abspath(path))
 
 
 # ------------------------ Rule Registry ------------------------ #
@@ -177,6 +183,44 @@ class FirewallManager:
             QMessageBox.critical(self.parent_widget, "Error", message)
         else:
             print("ERROR:", message, file=sys.stderr)
+
+    def find_rules_for_program(self, path: str):
+        """
+        Return rule names that already reference the given program path.
+        """
+        if not is_windows():
+            return []
+
+        safe_path = normalize_path(path)
+        args = ["advfirewall", "firewall", "show", "rule", "name=all", "verbose"]
+        proc = self._run_netsh(args)
+        if not proc or proc.returncode != 0:
+            self._show_error(
+                f"Failed to inspect existing firewall rules for:\n{path}\n\n"
+                f"Output:\n{proc.stdout}\nError:\n{proc.stderr}"
+                if proc else "Unknown netsh error."
+            )
+            return None
+
+        matches = []
+        current_rule_name = None
+
+        for raw_line in proc.stdout.splitlines():
+            line = raw_line.strip()
+            if not line or ":" not in line:
+                continue
+
+            key, value = line.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip().strip('"')
+
+            if key == "rule name":
+                current_rule_name = value or "(unnamed rule)"
+            elif key == "program":
+                if value and value != "Any" and normalize_path(value) == safe_path:
+                    matches.append(current_rule_name or "(unnamed rule)")
+
+        return matches
 
     def add_block_rules_for_file(self, path: str):
         """
@@ -360,6 +404,7 @@ class MainWindow(QWidget):
 
         self.thread = None
         self.worker = None
+        self.pre_skipped_count = 0
 
         self._build_ui()
 
@@ -516,7 +561,24 @@ class MainWindow(QWidget):
         if reply != QMessageBox.Yes:
             return
 
-        total = len(self.file_list)
+        block_targets = self._prepare_block_targets()
+        if block_targets is None:
+            self.append_log("Blocking cancelled during duplicate-rule review.")
+            return
+
+        files_to_block, pre_skipped_count = block_targets
+        self.pre_skipped_count = pre_skipped_count
+
+        if not files_to_block:
+            self.append_log("No files selected for blocking after duplicate-rule review.")
+            QMessageBox.information(
+                self,
+                "Nothing to Block",
+                "No files remain to block after checking existing firewall rules."
+            )
+            return
+
+        total = len(files_to_block)
         self.progress.setMaximum(total)
         self.progress.setValue(0)
         self.progress.setVisible(True)
@@ -528,7 +590,7 @@ class MainWindow(QWidget):
 
         # Create worker + thread
         self.thread = QThread()
-        self.worker = BlockWorker(self.file_list, self.registry, self.firewall)
+        self.worker = BlockWorker(files_to_block, self.registry, self.firewall)
         self.firewall.error_signal = self.worker.error
         self.worker.moveToThread(self.thread)
 
@@ -747,6 +809,71 @@ class MainWindow(QWidget):
         self.snapshot_export_btn.setEnabled(enabled)
         self.snapshot_import_btn.setEnabled(enabled)
 
+    def _prepare_block_targets(self):
+        """
+        Check for already-tracked and duplicate firewall entries before blocking.
+        Returns (files_to_block, pre_skipped_count), or None if cancelled.
+        """
+        files_to_block = []
+        pre_skipped_count = 0
+
+        for path in self.file_list:
+            if self.registry.has_rules_for(path):
+                pre_skipped_count += 1
+                continue
+
+            existing_rule_names = self.firewall.find_rules_for_program(path)
+            if existing_rule_names is None:
+                return None
+
+            if existing_rule_names:
+                reply = self._prompt_for_duplicate_rule(path, existing_rule_names)
+                if reply == "cancel":
+                    return None
+                if reply == "ignore":
+                    pre_skipped_count += 1
+                    self.append_log(f"Ignored duplicate firewall entry: {path}")
+                    continue
+
+            files_to_block.append(path)
+
+        return files_to_block, pre_skipped_count
+
+    def _prompt_for_duplicate_rule(self, path: str, rule_names):
+        """
+        Ask whether to skip or proceed when matching firewall rules already exist.
+        """
+        preview_names = "\n".join(rule_names[:5])
+        extra_count = len(rule_names) - min(len(rule_names), 5)
+        if extra_count > 0:
+            preview_names += f"\n... and {extra_count} more"
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Duplicate Firewall Rule")
+        box.setText(
+            "Existing firewall rule entries were found for this file:"
+            f"\n\n{path}"
+        )
+        box.setInformativeText(
+            f"Matching rule(s):\n{preview_names}\n\n"
+            "Choose Ignore to skip this file, or Proceed to add this app's rule anyway."
+        )
+        proceed_button = box.addButton("Proceed", QMessageBox.AcceptRole)
+        ignore_button = box.addButton("Ignore", QMessageBox.RejectRole)
+        cancel_button = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(ignore_button)
+        box.exec_()
+
+        clicked = box.clickedButton()
+        if clicked == proceed_button:
+            return "proceed"
+        if clicked == ignore_button:
+            return "ignore"
+        if clicked == cancel_button:
+            return "cancel"
+        return "cancel"
+
     # ---------- Blocking progress handlers ---------- #
 
     def update_block_progress(self, index, path):
@@ -758,14 +885,17 @@ class MainWindow(QWidget):
         self.registry.save()
         self._populate_list_widget()
 
+        total_skipped = skipped_count + self.pre_skipped_count
+
         self.append_log(
-            f"Blocking complete. New blocked: {blocked_count}, already blocked: {skipped_count}"
+            f"Blocking complete. New blocked: {blocked_count}, skipped: {total_skipped}"
         )
 
         self.progress.setVisible(False)
         self.progress_label.setVisible(False)
         self.cancel_button.setVisible(False)
         self._set_buttons_enabled(True)
+        self.pre_skipped_count = 0
 
     def blocking_cancelled(self):
         self.append_log("Blocking cancelled by user.")
@@ -773,6 +903,7 @@ class MainWindow(QWidget):
         self.progress_label.setVisible(False)
         self.cancel_button.setVisible(False)
         self._set_buttons_enabled(True)
+        self.pre_skipped_count = 0
 
     def cancel_blocking(self):
         if self.worker is not None:
