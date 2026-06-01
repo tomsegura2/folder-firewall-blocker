@@ -246,7 +246,7 @@ class FirewallManager:
             f"name={rule_out}",
             "dir=out",
             "action=block",
-            f'program="{safe_path}"',
+            f"program={safe_path}",
             "enable=yes",
             "profile=any"
         ]
@@ -256,7 +256,7 @@ class FirewallManager:
             f"name={rule_in}",
             "dir=in",
             "action=block",
-            f'program="{safe_path}"',
+            f"program={safe_path}",
             "enable=yes",
             "profile=any"
         ]
