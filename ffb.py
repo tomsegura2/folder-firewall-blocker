@@ -20,7 +20,7 @@ from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QLineEdit, QLabel, QCheckBox, QListWidget,
-    QListWidgetItem, QMessageBox, QTextEdit, QProgressBar
+    QListWidgetItem, QMessageBox, QTextEdit, QProgressBar, QGroupBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 
@@ -184,43 +184,75 @@ class FirewallManager:
         else:
             print("ERROR:", message, file=sys.stderr)
 
-    def find_rules_for_program(self, path: str):
+    def build_program_rule_map(self):
         """
-        Return rule names that already reference the given program path.
+        Dump all firewall rules ONCE and return a dict mapping
+        normalized program path -> [rule_name, ...].
+
+        Calling this once before a batch avoids the O(n) per-file
+        cost of dumping the entire firewall table for every exe.
+        Returns None on error.
         """
         if not is_windows():
-            return []
+            return {}
 
-        safe_path = normalize_path(path)
         args = ["advfirewall", "firewall", "show", "rule", "name=all", "verbose"]
         proc = self._run_netsh(args)
         if not proc or proc.returncode != 0:
             self._show_error(
-                f"Failed to inspect existing firewall rules for:\n{path}\n\n"
+                f"Failed to inspect existing firewall rules.\n\n"
                 f"Output:\n{proc.stdout}\nError:\n{proc.stderr}"
                 if proc else "Unknown netsh error."
             )
             return None
 
-        matches = []
+        program_map = {}  # normalized_path -> [rule_name, ...]
         current_rule_name = None
 
         for raw_line in proc.stdout.splitlines():
             line = raw_line.strip()
-            if not line or ":" not in line:
+            if not line:
                 continue
 
-            key, value = line.split(":", 1)
-            key = key.strip().lower()
-            value = value.strip().strip('"')
+            # Use split with maxsplit=1, but only on the FIRST colon that is
+            # followed by a space (avoids splitting on drive letters like C:\).
+            sep_idx = line.find(": ")
+            if sep_idx == -1:
+                continue
+
+            key = line[:sep_idx].strip().lower()
+            value = line[sep_idx + 2:].strip().strip('"')
 
             if key == "rule name":
                 current_rule_name = value or "(unnamed rule)"
             elif key == "program":
-                if value and value != "Any" and normalize_path(value) == safe_path:
-                    matches.append(current_rule_name or "(unnamed rule)")
+                if value and value.lower() != "any":
+                    norm = normalize_path(value)
+                    program_map.setdefault(norm, [])
+                    if current_rule_name:
+                        program_map[norm].append(current_rule_name)
 
-        return matches
+        return program_map
+
+    def find_rules_for_program(self, path: str, program_map=None):
+        """
+        Return rule names that already reference the given program path.
+        If program_map is provided (pre-built via build_program_rule_map),
+        it is used directly to avoid an extra netsh call.
+        """
+        if not is_windows():
+            return []
+
+        safe_path = normalize_path(path)
+
+        if program_map is not None:
+            return program_map.get(safe_path, [])
+
+        # Fallback: single-file lookup (kept for ad-hoc use).
+        rule_map = self.build_program_rule_map()
+        if rule_map is None:
+            return None
+        return rule_map.get(safe_path, [])
 
     def add_block_rules_for_file(self, path: str):
         """
@@ -350,6 +382,7 @@ class FirewallManager:
 # ------------------------ Worker for Threaded Blocking ------------------------ #
 
 class BlockWorker(QObject):
+    current_file = pyqtSignal(int, str)   # (index, file_path)
     progress = pyqtSignal(int, str)       # (index, file_path)
     finished = pyqtSignal(int, int)       # (blocked_count, skipped_count)
     cancelled = pyqtSignal()
@@ -365,6 +398,10 @@ class BlockWorker(QObject):
     def cancel(self):
         self._cancel = True
 
+    # Periodic save interval: flush the registry to disk every N successful blocks
+    # so a crash mid-run doesn't lose all tracking data.
+    SAVE_INTERVAL = 10
+
     def run(self):
         blocked_count = 0
         skipped_count = 0
@@ -374,6 +411,8 @@ class BlockWorker(QObject):
                 self.cancelled.emit()
                 return
 
+            self.current_file.emit(index, path)
+
             if self.registry.has_rules_for(path):
                 skipped_count += 1
             else:
@@ -381,6 +420,9 @@ class BlockWorker(QObject):
                 if rule_out and rule_in:
                     self.registry.set_rules_for(path, rule_out, rule_in)
                     blocked_count += 1
+                    # Periodic save so a mid-run crash doesn't lose progress.
+                    if blocked_count % self.SAVE_INTERVAL == 0:
+                        self.registry.save()
 
             self.progress.emit(index, path)
 
@@ -477,19 +519,28 @@ class MainWindow(QWidget):
         layout.addLayout(snap_layout)
 
         # Progress display
+        self.progress_group = QGroupBox("Blocking progress")
+        progress_layout = QVBoxLayout()
+        self.progress_group.setLayout(progress_layout)
+
         self.progress_label = QLabel("")
-        self.progress_label.setVisible(False)
-        layout.addWidget(self.progress_label)
+        progress_layout.addWidget(self.progress_label)
+
+        self.current_file_label = QLabel("")
+        self.current_file_label.setWordWrap(True)
+        self.current_file_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        progress_layout.addWidget(self.current_file_label)
 
         self.progress = QProgressBar()
         self.progress.setValue(0)
-        self.progress.setVisible(False)
-        layout.addWidget(self.progress)
+        progress_layout.addWidget(self.progress)
 
         self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.setVisible(False)
         self.cancel_button.clicked.connect(self.cancel_blocking)
-        layout.addWidget(self.cancel_button)
+        progress_layout.addWidget(self.cancel_button)
+
+        self.progress_group.setVisible(False)
+        layout.addWidget(self.progress_group)
 
         # File list
         self.list_widget = QListWidget()
@@ -581,12 +632,10 @@ class MainWindow(QWidget):
         total = len(files_to_block)
         self.progress.setMaximum(total)
         self.progress.setValue(0)
-        self.progress.setVisible(True)
 
-        self.progress_label.setText(f"Blocking 0 of {total}...")
-        self.progress_label.setVisible(True)
-
-        self.cancel_button.setVisible(True)
+        self.progress_label.setText(f"Completed 0 of {total}")
+        self.current_file_label.setText("Current file: waiting to start...")
+        self.progress_group.setVisible(True)
 
         # Create worker + thread
         self.thread = QThread()
@@ -596,6 +645,7 @@ class MainWindow(QWidget):
 
         # Connect signals
         self.thread.started.connect(self.worker.run)
+        self.worker.current_file.connect(self.update_current_block_file)
         self.worker.progress.connect(self.update_block_progress)
         self.worker.finished.connect(self.blocking_complete)
         self.worker.cancelled.connect(self.blocking_cancelled)
@@ -812,19 +862,24 @@ class MainWindow(QWidget):
     def _prepare_block_targets(self):
         """
         Check for already-tracked and duplicate firewall entries before blocking.
+        Builds the firewall rule map ONCE up front to avoid O(n) netsh dumps.
         Returns (files_to_block, pre_skipped_count), or None if cancelled.
         """
         files_to_block = []
         pre_skipped_count = 0
+
+        # Single netsh dump for the entire file list — O(1) instead of O(n).
+        self.append_log("Checking existing firewall rules (one-time scan)...")
+        program_map = self.firewall.build_program_rule_map()
+        if program_map is None:
+            return None  # error already reported inside build_program_rule_map
 
         for path in self.file_list:
             if self.registry.has_rules_for(path):
                 pre_skipped_count += 1
                 continue
 
-            existing_rule_names = self.firewall.find_rules_for_program(path)
-            if existing_rule_names is None:
-                return None
+            existing_rule_names = self.firewall.find_rules_for_program(path, program_map)
 
             if existing_rule_names:
                 reply = self._prompt_for_duplicate_rule(path, existing_rule_names)
@@ -876,10 +931,16 @@ class MainWindow(QWidget):
 
     # ---------- Blocking progress handlers ---------- #
 
+    def update_current_block_file(self, index, path):
+        total = self.progress.maximum()
+        self.progress_label.setText(f"Adding {index} of {total}")
+        self.current_file_label.setText(f"Current file:\n{path}")
+
     def update_block_progress(self, index, path):
         self.progress.setValue(index)
         total = self.progress.maximum()
-        self.progress_label.setText(f"Blocking {index} of {total}...\n{path}")
+        self.progress_label.setText(f"Completed {index} of {total}")
+        self.current_file_label.setText(f"Last added:\n{path}")
 
     def blocking_complete(self, blocked_count, skipped_count):
         self.registry.save()
@@ -891,17 +952,13 @@ class MainWindow(QWidget):
             f"Blocking complete. New blocked: {blocked_count}, skipped: {total_skipped}"
         )
 
-        self.progress.setVisible(False)
-        self.progress_label.setVisible(False)
-        self.cancel_button.setVisible(False)
+        self.progress_group.setVisible(False)
         self._set_buttons_enabled(True)
         self.pre_skipped_count = 0
 
     def blocking_cancelled(self):
         self.append_log("Blocking cancelled by user.")
-        self.progress.setVisible(False)
-        self.progress_label.setVisible(False)
-        self.cancel_button.setVisible(False)
+        self.progress_group.setVisible(False)
         self._set_buttons_enabled(True)
         self.pre_skipped_count = 0
 
