@@ -1,98 +1,118 @@
-PyFolderFirewallBlocker
-Copyright (c) 2025
+# Folder Firewall Blocker
 
-Licensed under the PolyForm Noncommercial License 1.0.0
+Folder Firewall Blocker is a small Windows desktop tool for creating Windows Defender Firewall block rules for every matching file in a selected folder. It is built with Python and PyQt5, and uses `netsh advfirewall` for firewall changes.
 
-You may not use this software for commercial purposes including but not limited to:
-- Selling this software or derivatives
-- Bundling in paid products
-- Offering as part of a commercial service
+## Features
 
-See full license:
-https://polyformproject.org/licenses/noncommercial/1.0.0/
+- Scan a folder for executable files.
+- Include or exclude subfolders.
+- Add extra file extensions, such as `.bat`, `.cmd`, `.ps1`, or `.dll`.
+- Create inbound and outbound block rules for all scanned files.
+- Skip files already tracked by this app.
+- Detect existing firewall rules that already reference a file and let you skip or proceed.
+- Unblock selected files.
+- Remove all firewall rules created by this app without touching unrelated firewall rules.
+- Export and import a full Windows Firewall snapshot.
+- Track created rules in a local JSON registry so they can be removed later.
 
-# Folder Firewall Blocker 2.0
+## Requirements
 
-PyFolderFirewallBlocker is a portable Windows utility that blocks all executable files within a selected folder (and optional subfolders) from accessing the internet by automatically creating Windows Firewall rules.
+- Windows
+- Administrator privileges
+- Python 3.10 or newer, if running from source
+- PyQt5, if running from source
+- PyInstaller, if building the executable
 
-Inspired by the discontinued Folder Firewall Blocker (2016), this modern replacement adds the features the original lacked — most importantly full reversibility, rule tracking, and firewall state recovery.
+The app relaunches itself with an administrator prompt when needed. Firewall changes will not work without elevation.
 
+## Download / Run
 
-**🔒 Core Features**
+The compiled executable is:
 
-Block internet access for:
+```text
+dist\ffb.exe
+```
 
-.exe, .dll, .sys, .msi, .bat, .cmd, .js, .vbs and more
+Run it on Windows and approve the administrator prompt.
 
-Custom file extensions (user-defined)
+## Usage
 
-Recursive folder scanning
+1. Choose a target folder.
+2. Leave `Include subfolders` checked if you want a recursive scan.
+3. Optionally enter extra file types, separated by commas, such as:
 
-Windows Firewall rule creation (inbound + outbound)
+   ```text
+   .bat,.cmd,.ps1
+   ```
 
-Automatic UAC elevation (Admin prompt)
+4. Click `Scan Folder`.
+5. Review the matching files.
+6. Click `Block ALL` to create firewall rules.
+7. Use `Unblock Selected` or `Unblock ALL (created by this app)` to remove rules created by this tool.
 
-Fully reversible rule management:
+By default, the app scans for `.exe` files.
 
-Unblock selected files
+## Firewall Rules
 
-Unblock all rules created by the app
+For each blocked file, the app creates two rules:
 
-Firewall snapshot system:
+- `PyFFB_OUT_<hash>` for outbound traffic
+- `PyFFB_IN_<hash>` for inbound traffic
 
-Export full firewall state
+Rules are created for all firewall profiles and are enabled immediately.
 
-Restore firewall to previous snapshot
+## Local Files
 
-Visual UI built with PyQt5
+The app stores its local state next to the script or executable:
 
-Portable design (no installation required)
+- `pyffb_rules.json` tracks firewall rules created by this app.
+- `pyffb_firewall_snapshot.wfw` stores a full Windows Firewall snapshot when exported.
 
-Safe rule namespace using hashed paths
+Do not delete `pyffb_rules.json` if you want the app to remember which rules it created.
 
-**💡 Use Cases**
+## Firewall Snapshot
 
-Sandbox legacy software
+`Export Firewall Snapshot` saves the entire current Windows Firewall policy to:
 
-Prevent telemetry or phone-home behavior
+```text
+pyffb_firewall_snapshot.wfw
+```
 
-Block background updaters
+`Import Firewall Snapshot` restores that snapshot and overwrites the current firewall policy. This can undo firewall changes made outside this app after the snapshot was created.
 
-Restrict game launchers / DRM services
+After importing a snapshot, the app clears its local rule registry because the current firewall state has been replaced.
 
-Secure testing environments
+## Build From Source
 
-**⚙️ How It Works**
+Install dependencies:
 
-The application scans the target directory, detects executable file types, and creates Windows Firewall rules via netsh advfirewall to deny inbound and outbound traffic on a per-file basis. All created rules are tracked in a local JSON registry so they can be cleanly removed or restored later.
+```powershell
+pip install PyQt5 pyinstaller
+```
 
-✅ Safer Than Manual Firewall Edits
+Build the executable:
 
-Unlike manual firewall configuration or legacy tools, PyFolderFirewallBlocker guarantees:
+```powershell
+pyinstaller --clean --noconfirm ffb.spec
+```
 
-No orphaned rules
+The built executable will be written to:
 
-Full rollback capability
+```text
+dist\ffb.exe
+```
 
-No modification of unrelated firewall policies
+## Run From Source
 
-**🖥 Requirements**
+```powershell
+python ffb.py
+```
 
-Windows 10 / 11
+The tool only works on Windows. It exits on non-Windows platforms.
 
-Administrator privileges
+## Safety Notes
 
-Python 3.8+
-
-PyQt5
-
-**📦 Packaging**
-
-To create a portable EXE:
-
-_pyinstaller --onefile --noconsole ffb.py
-
-**🚧 Disclaimer**
-
-This tool modifies Windows Firewall rules. Always export a firewall snapshot before bulk changes.
-
+- This tool modifies Windows Defender Firewall rules.
+- Use `Export Firewall Snapshot` before making large changes if you want a full restore point.
+- `Unblock ALL` only removes rules tracked in `pyffb_rules.json`.
+- Importing a firewall snapshot overwrites the full firewall policy, not just rules created by this app.
